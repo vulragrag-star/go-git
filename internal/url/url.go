@@ -35,11 +35,14 @@ func MatchesScheme(url string) bool {
 // matchScpLike reports whether s has the SCP-like shape canonical Git
 // accepts and returns its components:
 //
-//	^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$
+//	^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]*):(?P<path>(?:[^\\].*)?)$
 //
 // Git's own parser is parse_connect_url in connect.c[1]: the host ends
 // at the first `:` at or after the bracketed literal host_end finds, and
-// everything past that `:` is the path. There is no port in this form —
+// everything past that `:` is the path. Neither half has a minimum
+// length — the colon is the whole of the syntax, so `host:` is a
+// request for the empty path and `:path` is a request to the empty
+// host. There is no port in this form —
 // get_host_and_port only ever runs on the host half, which cannot hold a
 // `:` once the brackets are unwrapped. Git's documented spelling of the
 // shape[2] agrees: `[<user>@]<host>:/<path-to-git-repo>`, no port. The
@@ -77,7 +80,7 @@ func matchScpLike(s string) (user, host, path string, ok bool) {
 
 // matchScpLikeAfterUser matches the part of the SCP-like grammar that
 // follows the optional user, i.e.
-// `^(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$`.
+// `^(?P<host>\[[^\]\s]+\]|[^:\s]*):(?P<path>(?:[^\\].*)?)$`.
 //
 // The host is returned exactly as it was written, brackets included, so
 // that it stays a substring of the endpoint and can be handed straight
@@ -99,26 +102,29 @@ func matchScpLikeAfterUser(s string) (host, path string, ok bool) {
 		}
 	}
 
-	// `[^:\s]+` cannot contain a `:`, so the host must end at the first
-	// one, must be non-empty, and must hold no whitespace.
-	colon := strings.IndexByte(s, ':')
-	if colon <= 0 {
-		return "", "", false
-	}
-	host = s[:colon]
-	if strings.ContainsAny(host, scpLikeWhitespace) {
+	// `[^:\s]*` cannot contain a `:`, so the host must end at the first
+	// one, and must hold no whitespace. It may be empty: Git reaches an
+	// empty host for `:path`, and `ssh` reads that as the local user on
+	// the local machine.
+	host, rest, found := strings.Cut(s, ":")
+	if !found || strings.ContainsAny(host, scpLikeWhitespace) {
 		return "", "", false
 	}
 
-	if path, ok := matchScpLikePath(s[colon+1:]); ok {
+	if path, ok := matchScpLikePath(rest); ok {
 		return host, path, true
 	}
 	return "", "", false
 }
 
-// matchScpLikePath matches `^(?P<path>[^\\].*)$`.
+// matchScpLikePath matches `^(?P<path>(?:[^\\].*)?)$`.
 func matchScpLikePath(s string) (string, bool) {
-	if s == "" || s[0] == '\\' {
+	// The path may be empty: Git splits `host:` into a host and the
+	// empty path, and asks that host for `git-upload-pack ''`.
+	if s == "" {
+		return "", true
+	}
+	if s[0] == '\\' {
 		return "", false
 	}
 	// `.` excludes `\n` and `$` is end of text, so a newline anywhere

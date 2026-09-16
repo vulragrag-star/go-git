@@ -26,7 +26,7 @@ import (
 // `go test`, before any fuzzing.
 func FuzzURLScanner(f *testing.F) {
 	oracleScheme := regexp.MustCompile(`://`)
-	oracleScp := regexp.MustCompile(`^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$`)
+	oracleScp := regexp.MustCompile(`^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]*):(?P<path>(?:[^\\].*)?)$`)
 
 	for _, seed := range []string{
 		"", ":", "://", "a://", "a://b", "a:b://c", "://a", "a:/b", "a:",
@@ -34,6 +34,7 @@ func FuzzURLScanner(f *testing.F) {
 		"ssh://git@github.com/user/repository.git",
 		"http://git:pass@github.com:8080/user/repository.git?foo#bar",
 		"a@b:c", "a@b@c:d", "@host:p", "a@:path", "a@@b:c", "@:p", "a@b",
+		":", "a@:", "[a]:", "@:",
 		"host:path", ":path", "host:", "ho st:path", "ho\tst:path",
 		"ho\nst:path", "ho\rst:path", "ho\fst:path", "ho\vst:path",
 		"ho\x00st:path", "ho\xffst:path", "h\xc3\xa9st:path",
