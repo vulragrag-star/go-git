@@ -11,10 +11,6 @@ import (
 
 var fileIssueWindows = regexp.MustCompile(`^/[A-Za-z]:(/|\\)`)
 
-// scpLikeWhitespace is RE2's `\s` class, spelled out so the scanners
-// below stay exactly as permissive as the grammar they replace.
-const scpLikeWhitespace = "\t\n\f\r "
-
 // MatchesScheme returns true if the given string is written in the
 // URL form rather than the SCP-like or local one.
 //
@@ -35,14 +31,16 @@ func MatchesScheme(url string) bool {
 // matchScpLike reports whether s has the SCP-like shape canonical Git
 // accepts and returns its components:
 //
-//	^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]*):(?P<path>(?:[^\\].*)?)$
+//	(?s)^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]]+\]|[^:]*):(?P<path>.*)$
 //
 // Git's own parser is parse_connect_url in connect.c[1]: the host ends
 // at the first `:` at or after the bracketed literal host_end finds, and
 // everything past that `:` is the path. Neither half has a minimum
 // length — the colon is the whole of the syntax, so `host:` is a
 // request for the empty path and `:path` is a request to the empty
-// host. There is no port in this form —
+// host. Neither half excludes a byte either: Git puts no restriction on
+// what a host or a path may contain, so nothing here does — whitespace,
+// newlines and invalid UTF-8 included. There is no port in this form —
 // get_host_and_port only ever runs on the host half, which cannot hold a
 // `:` once the brackets are unwrapped. Git's documented spelling of the
 // shape[2] agrees: `[<user>@]<host>:/<path-to-git-repo>`, no port. The
@@ -80,61 +78,34 @@ func matchScpLike(s string) (user, host, path string, ok bool) {
 
 // matchScpLikeAfterUser matches the part of the SCP-like grammar that
 // follows the optional user, i.e.
-// `^(?P<host>\[[^\]\s]+\]|[^:\s]*):(?P<path>(?:[^\\].*)?)$`.
+// `(?s)^(?P<host>\[[^\]]+\]|[^:]*):(?P<path>.*)$`.
 //
 // The host is returned exactly as it was written, brackets included, so
 // that it stays a substring of the endpoint and can be handed straight
 // to net/url, which wants an IPv6 literal bracketed, or pasted back into
 // an SCP-like URL that parses the same way again.
 func matchScpLikeAfterUser(s string) (host, path string, ok bool) {
-	// `\[[^\]\s]+\]` is the first alternative, so a bracketed host is
+	// `\[[^\]]+\]` is the first alternative, so a bracketed host is
 	// preferred whenever one parses. Its body cannot contain a `]`, so
-	// the literal ends at the first one; it holds no whitespace and must
-	// be non-empty, and the `]` must be followed by the closing `:`.
+	// the literal ends at the first one; it must be non-empty, and the
+	// `]` must be followed by the closing `:`.
 	if strings.HasPrefix(s, "[") {
-		if end := strings.IndexByte(s, ']'); end > 1 &&
-			!strings.ContainsAny(s[1:end], scpLikeWhitespace) {
-			if rest, found := strings.CutPrefix(s[end+1:], ":"); found {
-				if path, ok := matchScpLikePath(rest); ok {
-					return s[:end+1], path, true
-				}
+		if end := strings.IndexByte(s, ']'); end > 1 {
+			if path, found := strings.CutPrefix(s[end+1:], ":"); found {
+				return s[:end+1], path, true
 			}
 		}
 	}
 
-	// `[^:\s]*` cannot contain a `:`, so the host must end at the first
-	// one, and must hold no whitespace. It may be empty: Git reaches an
-	// empty host for `:path`, and `ssh` reads that as the local user on
-	// the local machine.
-	host, rest, found := strings.Cut(s, ":")
-	if !found || strings.ContainsAny(host, scpLikeWhitespace) {
+	// `[^:]*` cannot contain a `:`, so the host is exactly the text
+	// before the first one. It may be empty: Git reaches an empty host
+	// for `:path`, and ssh reads that as the local machine. Everything
+	// after the `:` is the path, whatever it holds.
+	host, path, found := strings.Cut(s, ":")
+	if !found {
 		return "", "", false
 	}
-
-	if path, ok := matchScpLikePath(rest); ok {
-		return host, path, true
-	}
-	return "", "", false
-}
-
-// matchScpLikePath matches `^(?P<path>(?:[^\\].*)?)$`.
-func matchScpLikePath(s string) (string, bool) {
-	// The path may be empty: Git splits `host:` into a host and the
-	// empty path, and asks that host for `git-upload-pack ''`.
-	if s == "" {
-		return "", true
-	}
-	if s[0] == '\\' {
-		return "", false
-	}
-	// `.` excludes `\n` and `$` is end of text, so a newline anywhere
-	// past the first rune fails the match. `\n` is never a UTF-8
-	// continuation byte, so scanning from the second byte is exact even
-	// when the first rune is multi-byte.
-	if strings.IndexByte(s[1:], '\n') >= 0 {
-		return "", false
-	}
-	return s, true
+	return host, path, true
 }
 
 // MatchesScpLike returns true if the given string matches an SCP-like
@@ -143,15 +114,21 @@ func MatchesScpLike(url string) bool {
 	if _, _, _, ok := matchScpLike(url); !ok {
 		return false
 	}
-	// Mirror canonical Git's url_is_local_not_ssh in connect.c[1] for
-	// the cases the regex above cannot disambiguate by itself: a URL
-	// is treated as a local path (not SCP-style SSH) when a `/`
-	// precedes the first `:` (e.g. `./relative:path`,
-	// `/abs/with:colon/file`), or — on Windows only — when it has a
-	// DOS drive prefix like `C:foo` where the host is a single
-	// ASCII letter.
+	// Mirror canonical Git's url_is_local_not_ssh in url.c[1] for the
+	// cases the grammar above cannot disambiguate by itself: an
+	// endpoint is a local path, not SCP-style SSH, when a `/` precedes
+	// the first `:` (e.g. `./relative:path`, `/abs/with:colon/file`),
+	// or — on Windows only — when it has a DOS drive prefix like
+	// `C:foo` or `C:\repo`.
 	//
-	// [1]: https://github.com/git/git/blob/v2.54.0/connect.c#L710-L716
+	// The platform gate is Git's, not an approximation of it:
+	// has_dos_drive_prefix is a no-op everywhere but Windows
+	// (git-compat-util.h), and it is the only route to the local
+	// reading for a drive-letter endpoint. So `C:\repo` is a path on
+	// Windows and an SSH request to the host `C` on a Linux or macOS
+	// host, in Git and here alike.
+	//
+	// [1]: https://github.com/git/git/blob/v2.56.0/url.c#L136-L142
 	if before, _, _ := strings.Cut(url, ":"); strings.Contains(before, "/") {
 		return false
 	}
@@ -165,7 +142,7 @@ func MatchesScpLike(url string) bool {
 // Windows drive prefix such as `C:` or `c:`). Mirrors canonical Git's
 // win32_has_dos_drive_prefix[1].
 //
-// [1]: https://github.com/git/git/blob/v2.54.0/compat/win32/path-utils.c#L20-L29
+// [1]: https://github.com/git/git/blob/v2.56.0/compat/win32/path-utils.c#L7-L28
 func hasDosDrivePrefix(s string) bool {
 	if len(s) < 2 || s[1] != ':' {
 		return false
