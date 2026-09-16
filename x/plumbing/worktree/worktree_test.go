@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -1305,6 +1306,59 @@ func TestWorktreeConfig(t *testing.T) {
 		repoCfg, err := repo.Config()
 		require.NoError(t, err)
 		assert.Equal(t, customWorktreePath, repoCfg.Core.Worktree)
+	})
+}
+
+func TestValidateName(t *testing.T) {
+	t.Parallel()
+
+	t.Run("accepts a name at the length limit", func(t *testing.T) {
+		t.Parallel()
+
+		require.NoError(t, validateName(strings.Repeat("a", maxWorktreeNameLen)))
+	})
+
+	t.Run("rejects a name over the length limit", func(t *testing.T) {
+		t.Parallel()
+
+		err := validateName(strings.Repeat("a", maxWorktreeNameLen+1))
+		require.ErrorIs(t, err, ErrInvalidWorktreeName)
+		require.ErrorContains(t, err, "exceeds the 255 byte limit")
+	})
+
+	t.Run("rejects a name of the wrong shape", func(t *testing.T) {
+		t.Parallel()
+
+		err := validateName("has spaces")
+		require.ErrorIs(t, err, ErrInvalidWorktreeName)
+		require.ErrorContains(t, err, `"has spaces"`)
+	})
+
+	// A rejected name reaches an error message by one of two routes, and both
+	// stay the size of a message rather than the size of the name: too long
+	// for the length check, which reports the length, or the right length but
+	// the wrong shape, which is quoted back bounded. The bytes are the ones
+	// quoting expands the furthest.
+	t.Run("error stays bounded", func(t *testing.T) {
+		t.Parallel()
+
+		for _, b := range []byte{'a', 0x00, 0xff, ':'} {
+			name := strings.Repeat(string([]byte{b}), 1<<20)
+			err := validateName(name)
+			require.Error(t, err)
+			require.Less(t, len(err.Error()), 128,
+				"length error for byte %#x quotes too much of the name", b)
+		}
+
+		// Bytes that worktreeNameRE rejects, at a length the check above
+		// admits, so the name reaches the quoting branch instead.
+		for _, b := range []byte{0x00, 0xff, ':'} {
+			name := strings.Repeat(string([]byte{b}), maxWorktreeNameLen)
+			err := validateName(name)
+			require.Error(t, err)
+			require.Less(t, len(err.Error()), 320,
+				"quoted error for byte %#x quotes too much of the name", b)
+		}
 	})
 }
 
