@@ -3,7 +3,6 @@ package url
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"regexp"
 	"runtime"
@@ -26,10 +25,19 @@ func MatchesScheme(url string) bool {
 	return i > 0 && strings.HasPrefix(url[i:], "://")
 }
 
-// matchScpLike reports whether s has the SCP-like shape described by
-// Git's URL documentation[1] and returns its components:
+// matchScpLike reports whether s has the SCP-like shape canonical Git
+// accepts and returns its components:
 //
-//	^(?:(?P<user>[^@]+)@)?(?P<host>[^:\s]+):(?:(?P<port>[0-9]{1,5}):)?(?P<path>[^\\].*)$
+//	^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$
+//
+// Git's own parser is parse_connect_url in connect.c[1]: the host ends
+// at the first `:` at or after the bracketed literal host_end finds, and
+// everything past that `:` is the path. There is no port in this form —
+// get_host_and_port only ever runs on the host half, which cannot hold a
+// `:` once the brackets are unwrapped. Git's documented spelling of the
+// shape[2] agrees: `[<user>@]<host>:/<path-to-git-repo>`, no port. The
+// bracketed host is not in that document at all; connect.c is the only
+// place it is written down.
 //
 // It is scanned by hand rather than matched with a regexp. The grammar
 // is anchored at both ends and every group is closed by a single byte,
@@ -37,52 +45,68 @@ func MatchesScheme(url string) bool {
 // by simulating the whole endpoint and allocating to return the groups,
 // which costs around a hundred times as much per byte.
 //
-// The optional groups are greedy, so the branches are tried in the same
-// order the regexp would: user before no-user, port before no-port.
+// The alternation and the optional group are ordered, so the branches
+// are tried in the order the regexp would: user before no-user,
+// bracketed host before bare host.
 //
-// [1]: https://github.com/git/git/blob/v2.54.0/Documentation/urls.adoc#L41-L48
-func matchScpLike(s string) (user, host, port, path string, ok bool) {
+// [1]: https://github.com/git/git/blob/v2.56.0/connect.c#L1097-L1165
+// [2]: https://github.com/git/git/blob/v2.56.0/Documentation/urls.adoc#L23-L25
+func matchScpLike(s string) (user, host, path string, ok bool) {
 	// `[^@]+` cannot contain an `@`, so the user can only ever be the
 	// text preceding the first one, and must be non-empty.
 	if at := strings.IndexByte(s, '@'); at > 0 {
-		if host, port, path, ok := matchScpLikeAfterUser(s[at+1:]); ok {
-			return s[:at], host, port, path, true
+		if host, path, ok := matchScpLikeAfterUser(s[at+1:]); ok {
+			return s[:at], host, path, true
 		}
 	}
-	if host, port, path, ok := matchScpLikeAfterUser(s); ok {
-		return "", host, port, path, true
+	if host, path, ok := matchScpLikeAfterUser(s); ok {
+		return "", host, path, true
 	}
 
 	// On a non-match every component is empty, so a caller that ignores
 	// ok cannot mistake a partial parse for a result.
-	return "", "", "", "", false
+	return "", "", "", false
 }
 
 // matchScpLikeAfterUser matches the part of the SCP-like grammar that
 // follows the optional user, i.e.
-// `^(?P<host>[^:\s]+):(?:(?P<port>[0-9]{1,5}):)?(?P<path>[^\\].*)$`.
-func matchScpLikeAfterUser(s string) (host, port, path string, ok bool) {
+// `^(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$`.
+//
+// The host is returned exactly as it was written, brackets included, so
+// that it stays a substring of the endpoint and can be handed straight
+// to net/url, which wants an IPv6 literal bracketed, or pasted back into
+// an SCP-like URL that parses the same way again.
+func matchScpLikeAfterUser(s string) (host, path string, ok bool) {
+	// `\[[^\]\s]+\]` is the first alternative, so a bracketed host is
+	// preferred whenever one parses. Its body cannot contain a `]`, so
+	// the literal ends at the first one; it holds no whitespace and must
+	// be non-empty, and the `]` must be followed by the closing `:`.
+	if strings.HasPrefix(s, "[") {
+		if end := strings.IndexByte(s, ']'); end > 1 &&
+			!strings.ContainsAny(s[1:end], scpLikeWhitespace) {
+			if rest, found := strings.CutPrefix(s[end+1:], ":"); found {
+				if path, ok := matchScpLikePath(rest); ok {
+					return s[:end+1], path, true
+				}
+			}
+		}
+	}
+
 	// `[^:\s]+` cannot contain a `:`, so the host must end at the first
 	// one, must be non-empty, and must hold no whitespace.
 	colon := strings.IndexByte(s, ':')
 	if colon <= 0 {
-		return "", "", "", false
+		return "", "", false
 	}
 	host = s[:colon]
 	if strings.ContainsAny(host, scpLikeWhitespace) {
-		return "", "", "", false
+		return "", "", false
 	}
 
-	rest := s[colon+1:]
-	// `[0-9]{1,5}` is greedy and cannot contain the `:` that closes it,
-	// so the only candidate port is the full run of leading digits.
-	if n := leadingDigits(rest); n >= 1 && n <= 5 && n < len(rest) && rest[n] == ':' {
-		if path, ok := matchScpLikePath(rest[n+1:]); ok {
-			return host, rest[:n], path, true
-		}
+	if path, ok := matchScpLikePath(s[colon+1:]); ok {
+		return host, path, true
 	}
-	path, ok = matchScpLikePath(rest)
-	return host, "", path, ok
+	return "", "", false
 }
 
 // matchScpLikePath matches `^(?P<path>[^\\].*)$`.
@@ -100,20 +124,10 @@ func matchScpLikePath(s string) (string, bool) {
 	return s, true
 }
 
-// leadingDigits returns the length of the run of ASCII digits at the
-// start of s.
-func leadingDigits(s string) int {
-	i := 0
-	for i < len(s) && '0' <= s[i] && s[i] <= '9' {
-		i++
-	}
-	return i
-}
-
 // MatchesScpLike returns true if the given string matches an SCP-like
 // format scheme.
 func MatchesScpLike(url string) bool {
-	if _, _, _, _, ok := matchScpLike(url); !ok {
+	if _, _, _, ok := matchScpLike(url); !ok {
 		return false
 	}
 	// Mirror canonical Git's url_is_local_not_ssh in connect.c[1] for
@@ -147,10 +161,14 @@ func hasDosDrivePrefix(s string) bool {
 	return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
 }
 
-// FindScpLikeComponents returns the user, host, port and path of the
-// given SCP-like URL, and whether url has that shape at all. The four
+// FindScpLikeComponents returns the user, host and path of the given
+// SCP-like URL, and whether url has that shape at all. The three
 // components are empty when it does not.
-func FindScpLikeComponents(url string) (user, host, port, path string, ok bool) {
+//
+// There is no port: the SCP-like form has no way to spell one, so
+// everything after the first `:` is the path. The host keeps its
+// brackets when it is written as a literal, e.g. `[fe80::1]`.
+func FindScpLikeComponents(url string) (user, host, path string, ok bool) {
 	return matchScpLike(url)
 }
 
@@ -213,13 +231,9 @@ func ParseSCP(endpoint string) (*url.URL, bool) {
 		return nil, false
 	}
 
-	user, host, port, path, ok := FindScpLikeComponents(endpoint)
+	user, host, path, ok := FindScpLikeComponents(endpoint)
 	if !ok {
 		return nil, false
-	}
-
-	if port != "" {
-		host = net.JoinHostPort(host, port)
 	}
 
 	return &url.URL{
