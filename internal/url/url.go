@@ -15,14 +15,21 @@ var fileIssueWindows = regexp.MustCompile(`^/[A-Za-z]:(/|\\)`)
 // below stay exactly as permissive as the grammar they replace.
 const scpLikeWhitespace = "\t\n\f\r "
 
-// MatchesScheme returns true if the given string matches a URL-like
-// format scheme.
+// MatchesScheme returns true if the given string is written in the
+// URL form rather than the SCP-like or local one.
 //
-// Equivalent to `^[^:]+://`: the scheme cannot contain a `:`, so it can
-// only ever end at the first one.
+// Equivalent to `://`. Canonical Git splits an endpoint on the FIRST
+// `://` anywhere in it — parse_connect_url does `host = strstr(url,
+// "://")`[1] — and everything before that is the scheme, whatever it
+// contains. It is not required to start at the first `:`, or to be a
+// syntactically valid scheme, or to be non-empty: what Git looks up in
+// url_get_scheme is simply the text preceding the separator, and an
+// endpoint it cannot name a protocol for is refused rather than read
+// as something else.
+//
+// [1]: https://github.com/git/git/blob/v2.56.0/connect.c#L1111
 func MatchesScheme(url string) bool {
-	i := strings.IndexByte(url, ':')
-	return i > 0 && strings.HasPrefix(url[i:], "://")
+	return strings.Contains(url, "://")
 }
 
 // matchScpLike reports whether s has the SCP-like shape canonical Git

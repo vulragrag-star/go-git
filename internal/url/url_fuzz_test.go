@@ -25,11 +25,12 @@ import (
 // the scanners disagrees on a seed and fails this target under plain
 // `go test`, before any fuzzing.
 func FuzzURLScanner(f *testing.F) {
-	oracleScheme := regexp.MustCompile(`^[^:]+://`)
+	oracleScheme := regexp.MustCompile(`://`)
 	oracleScp := regexp.MustCompile(`^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$`)
 
 	for _, seed := range []string{
 		"", ":", "://", "a://", "a://b", "a:b://c", "://a", "a:/b", "a:",
+		"git@host:a://b", "/abs/a://b", "./foo://bar",
 		"ssh://git@github.com/user/repository.git",
 		"http://git:pass@github.com:8080/user/repository.git?foo#bar",
 		"a@b:c", "a@b@c:d", "@host:p", "a@:path", "a@@b:c", "@:p", "a@b",

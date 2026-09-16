@@ -13,6 +13,10 @@ import (
 // production path never runs a regexp while the scanners keep an
 // executable specification.
 //
+// oracleScheme is unanchored and holds no scheme at all, because Git
+// does not look for one: parse_connect_url takes the first `://`
+// anywhere in the endpoint and calls whatever precedes it the scheme.
+//
 // oracleScp is the grammar go-git INTENDS, which is canonical Git's:
 // the SCP-like form has no port, so the path is everything after the
 // first `:`, and a bracketed literal host is a host. It is no longer
@@ -25,7 +29,7 @@ import (
 // these two, and the differential fuzz target in url_fuzz_test.go does
 // the same under coverage-guided search.
 var (
-	oracleScheme = regexp.MustCompile(`^[^:]+://`)
+	oracleScheme = regexp.MustCompile(`://`)
 	oracleScp    = regexp.MustCompile(`^(?:(?P<user>[^@]+)@)?(?P<host>\[[^\]\s]+\]|[^:\s]+):(?P<path>[^\\].*)$`)
 )
 
@@ -72,6 +76,7 @@ func wide() bool { return os.Getenv("GOGIT_URL_SWEEP") == "wide" }
 var equivSeeds = []string{
 	// Scheme detection.
 	"", ":", "://", "a://", "a://b", "a:b://c", "://a", "a:/b", "a:",
+	"git@host:a://b", "/abs/a://b", "./foo://bar",
 	"ssh://git@github.com/user/repository.git",
 	"http://git:pass@github.com:8080/user/repository.git?foo#bar",
 
@@ -350,8 +355,12 @@ func TestScannerRules(t *testing.T) {
 // TestSchemeRules records what MatchesScheme's IndexByte stands in for.
 func TestSchemeRules(t *testing.T) {
 	t.Parallel()
-	t.Log("`^[^:]+://` cannot cross a `:`, so the scheme must end at the FIRST " +
-		"one and that colon must open `://`. A later `://` does not count.")
+	t.Log("`://` is all there is to it: Git's parse_connect_url does " +
+		"strstr(url, \"://\") and calls everything before the FIRST one the " +
+		"scheme, so the separator need not follow the first `:`, the scheme " +
+		"need not be syntactically valid, and it need not be non-empty. An " +
+		"endpoint Git cannot name a protocol for is refused, never re-read " +
+		"as an SCP-like or local one.")
 
 	for _, c := range []struct {
 		in   string
@@ -361,11 +370,21 @@ func TestSchemeRules(t *testing.T) {
 		{"http://host/path", true},
 		{"", false},
 		{":", false},
-		{"://a", false},    // empty scheme
-		{"a:/b", false},    // one slash
-		{"a:", false},      // nothing after the colon
-		{"a:b://c", false}, // the first colon is not the one opening `://`
-		{"a\n://b", true},  // `[^:]` matches \n
+		{"a:/b", false}, // one slash
+		{"a:", false},   // nothing after the colon
+		// An empty scheme is still a scheme: Git dies with
+		// "protocol '' is not supported".
+		{"://a", true},
+		{"://", true},
+		// The separator is the first `://` anywhere, not one opening at
+		// the first `:`. Git dies with "protocol 'a:b' is not supported".
+		{"a:b://c", true},
+		// Which reaches endpoints that otherwise read as SCP-like or
+		// local. Git: "protocol 'git@host:a'", "protocol '/abs/a'".
+		{"git@host:a://b", true},
+		{"/abs/a://b", true},
+		{"./foo://bar", true},
+		{"a\n://b", true}, // no byte is excluded from the scheme
 		{"\x00://b", true},
 		{"\xff://b", true},
 	} {
