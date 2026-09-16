@@ -1807,6 +1807,11 @@ func (d *DotGit) isGitDir(p string) (bool, error) {
 		return false, nil
 	}
 
+	// Whether commondir moved the checks below off p. A redirected prefix
+	// is a path the file named rather than one this walked to, so a
+	// failure to resolve it is reported instead of read as an absence.
+	redirected := false
+
 	commonFile := d.fs.Join(p, "commondir")
 	fi, err := d.fs.Stat(commonFile)
 	switch {
@@ -1860,11 +1865,25 @@ func (d *DotGit) isGitDir(p string) (bool, error) {
 			return false, fmt.Errorf("submodule common directory %q is outside the filesystem", common)
 		}
 		p = common
+		redirected = true
 	}
 
 	for _, dir := range []string{objectsPath, refsPath} {
-		fi, err := d.fs.Stat(d.fs.Join(p, dir))
-		if err != nil || !fi.IsDir() {
+		q := d.fs.Join(p, dir)
+		fi, err := d.fs.Stat(q)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return false, nil
+		case err != nil && redirected:
+			// The containment check above is lexical, so it sees a
+			// written "../" but not a symlink standing in a component.
+			// Such a path leaves the filesystem on the way to this Stat,
+			// and reading that failure as "no Git directory here" would
+			// let the commondir turn the check off. Only a prefix the
+			// file redirected can reach this: elsewhere an unreadable
+			// directory stays an absence, as it is in Git.
+			return false, fmt.Errorf("resolve submodule common directory %q: %w", q, err)
+		case err != nil || !fi.IsDir():
 			return false, nil
 		}
 	}
